@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#000000">
+<title>소음 감지 신호등</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; width:100%; min-height:100%; background:#000; color:#fff; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+  body { min-height:100svh; display:flex; flex-direction:column; padding-bottom:env(safe-area-inset-bottom); }
+  #signal { flex:1 1 auto; min-height:45svh; background:#000; transition:background-color .12s linear; }
+  #panel { flex:0 0 auto; padding:16px max(16px, env(safe-area-inset-right)) calc(18px + env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left)); background:#111; }
+  h1 { font-size:clamp(18px, 4.5vw, 22px); margin:0 0 10px; }
+  p { color:#ccc; line-height:1.45; font-size:14px; margin:8px 0; }
+  button { border:0; border-radius:12px; padding:15px 16px; min-height:50px; font-size:16px; font-weight:700; width:100%; margin:6px 0; touch-action:manipulation; }
+  #start { background:#fff; color:#111; }
+  #stop { background:#444; color:#fff; }
+  button:disabled { opacity:.45; }
+  label { display:block; margin-top:12px; font-size:14px; }
+  input { width:100%; min-height:30px; margin:8px 0; accent-color:#fff; }
+  .small { font-size:12px; color:#aaa; }
+  #status { font-size:17px; font-weight:700; margin:10px 0 4px; }
+  #meter { font-variant-numeric:tabular-nums; }
+  @media (max-width: 600px) {
+    #signal { min-height:42svh; }
+    #panel { padding-top:13px; }
+    p { font-size:13px; }
+  }
+  @media (orientation: landscape) and (max-height: 500px) {
+    body { flex-direction:row; }
+    #signal { min-height:100svh; }
+    #panel { width:min(360px, 45vw); overflow-y:auto; padding:12px; }
+  }
+</style>
+</head>
+<body>
+<div id="signal" aria-label="소음 신호등 화면"></div>
+<section id="panel">
+  <h1>소음 감지 신호등</h1>
+  <div id="status" role="status" aria-live="polite">시작 버튼을 눌러 주세요.</div>
+  <p id="meter">소리 감지값: --</p>
+  <button id="start">마이크 켜고 측정 시작</button>
+  <button id="stop" disabled>측정 중지</button>
+  <label for="threshold">빨간색 작동 민감도 <strong id="thresholdValue">35</strong></label>
+  <input id="threshold" type="range" min="5" max="90" value="35">
+  <p class="small">값을 낮추면 작은 소리에도 반응하고, 높이면 더 큰 소리에 반응합니다. 표시값은 보정된 dB가 아닌 기기 마이크의 상대적인 감지값입니다.</p>
+  <p class="small">소음 기준을 넘으면 빨간색이 됩니다. 기준 아래로 내려가면 5초 뒤 검은색으로 돌아오며, 그 사이 다시 시끄러워지면 5초 카운트가 다시 시작됩니다.</p>
+  <p class="small">휴대폰/태블릿의 마이크 위치와 자동 음량 조절에 따라 감지값이 달라질 수 있습니다.</p>
+</section>
+<script>
+(() => {
+  const signal = document.getElementById('signal');
+  const status = document.getElementById('status');
+  const meter = document.getElementById('meter');
+  const startBtn = document.getElementById('start');
+  const stopBtn = document.getElementById('stop');
+  const slider = document.getElementById('threshold');
+  const thresholdValue = document.getElementById('thresholdValue');
+
+  let audioContext, analyser, stream, source, rafId, wakeLock;
+  let red = false;
+  let quietSince = null;
+  let smoothed = 0;
+  let lastUpdate = 0;
+  const buffer = new Uint8Array(2048);
+
+  slider.addEventListener('input', () => thresholdValue.textContent = slider.value);
+
+  function paint(isRed) {
+    red = isRed;
+    signal.style.backgroundColor = isRed ? '#f00000' : '#000000';
+    document.body.style.backgroundColor = isRed ? '#f00000' : '#000000';
+  }
+
+  async function requestWakeLock() {
+    try {
+      if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen');
+    } catch (_) {}
+  }
+
+  async function stop() {
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = null;
+    if (wakeLock) { try { await wakeLock.release(); } catch (_) {} wakeLock = null; }
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    if (audioContext && audioContext.state !== 'closed') {
+      try { await audioContext.close(); } catch (_) {}
+    }
+    stream = source = analyser = audioContext = null;
+    paint(false);
+    quietSince = null;
+    status.textContent = '측정이 중지되었습니다.';
+    meter.textContent = '소리 감지값: --';
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+  }
+
+  function loop() {
+    if (!analyser) return;
+    analyser.getByteTimeDomainData(buffer);
+    let sum = 0;
+    for (let i = 0; i < buffer.length; i++) {
+      const v = (buffer[i] - 128) / 128;
+      sum += v * v;
+    }
+    const rms = Math.sqrt(sum / buffer.length);
+    const level = Math.min(100, Math.round(rms * 450));
+    smoothed = smoothed * 0.72 + level * 0.28;
+    const threshold = Number(slider.value);
+    const now = Date.now();
+
+    if (smoothed >= threshold) {
+      paint(true);
+      quietSince = null;
+      status.textContent = '시끄러움 — 빨간색';
+    } else if (red) {
+      if (quietSince === null) quietSince = now;
+      if (now - quietSince >= 5000) {
+        paint(false);
+        quietSince = null;
+        status.textContent = '조용함 — 검은색';
+      } else {
+        status.textContent = '소음 감소 — 5초 대기 중';
+      }
+    } else {
+      status.textContent = '조용함 — 검은색';
+    }
+
+    if (now - lastUpdate > 150) {
+      meter.textContent = '소리 감지값: ' + Math.round(smoothed) + ' / 기준: ' + threshold;
+      lastUpdate = now;
+    }
+    rafId = requestAnimationFrame(loop);
+  }
+
+  startBtn.addEventListener('click', async () => {
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('이 페이지에서 마이크 기능을 사용할 수 없습니다. HTTPS 주소로 열거나 Safari/Chrome의 마이크 권한을 확인해 주세요.');
+      }
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+      });
+      audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      await audioContext.resume();
+      analyser = audioContext.createAnalyser();
+      analyser.fftSize = 2048;
+      source = audioContext.createMediaStreamSource(stream);
+      source.connect(analyser);
+      smoothed = 0;
+      paint(false);
+      await requestWakeLock();
+      status.textContent = '마이크 작동 중 — 소리를 감지하고 있습니다.';
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      loop();
+    } catch (e) {
+      status.textContent = '마이크를 시작할 수 없습니다.';
+      alert((e && e.message ? e.message : '마이크 권한을 확인해 주세요.') +
+        '\n\n브라우저 설정에서 이 페이지의 마이크 접근을 허용해 주세요.');
+      await stop();
+    }
+  });
+
+  stopBtn.addEventListener('click', stop);
+  document.addEventListener('visibilitychange', async () => {
+    if (document.visibilityState === 'visible' && analyser) await requestWakeLock();
+  });
+})();
+</script>
+</body>
+</html>
